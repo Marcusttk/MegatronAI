@@ -1,122 +1,126 @@
-from pathlib import Path
-from langchain_text_splitters import RecursiveCharacterTextSplitter
+import json
 import ollama
-import faiss
-import numpy as np
-import pickle
 
-# ==========================
-# SETTINGS
-# ==========================
 
-# Folder containing your downloaded Discord txt files
-TXT_FOLDER = "discord_channels"
+def build_text(message):
+    """
+    Convert a Discord message into searchable text.
+    """
 
-# Embedding model
-EMBED_MODEL = "nomic-embed-text"
+    author = message["author"]["display_name"]
+    content = message["content"].strip()
 
-# Output files
-FAISS_INDEX = "discord.index"
-CHUNKS_FILE = "discord_chunks.pkl"
+    if not content:
+        return None
 
-# Chunk settings
-CHUNK_SIZE = 1000
-CHUNK_OVERLAP = 200
+    return f"Author: {author}\nMessage: {content}"
 
-# ==========================
-# LOAD TXT FILES
-# ==========================
 
-documents = []
+def generate_embedding(text, model="nomic-embed-text"):
+    """
+    Generate a single embedding using Ollama.
+    """
 
-txt_files = list(Path(TXT_FOLDER).glob("*.txt"))
-
-if len(txt_files) == 0:
-    raise Exception(f"No txt files found inside '{TXT_FOLDER}'")
-
-for file in txt_files:
-    print(f"Reading {file.name}")
-
-    text = file.read_text(
-        encoding="utf-8",
-        errors="ignore"
+    response = ollama.embed(
+        model=model,
+        input=text
     )
 
-    documents.append(
-        {
-            "source": file.name,
-            "text": text
-        }
-    )
+    return response["embeddings"][0]
 
-# ==========================
-# SPLIT INTO CHUNKS
-# ==========================
 
-splitter = RecursiveCharacterTextSplitter(
-    chunk_size=CHUNK_SIZE,
-    chunk_overlap=CHUNK_OVERLAP
-)
+def embed_jsonl(jsonl_path, model="nomic-embed-text"):
+    """
+    Read a JSONL file and return embeddings + metadata.
+    """
 
-chunks = []
+    embeddings = []
+    metadata = []
 
-for doc in documents:
+    with open(jsonl_path, "r", encoding="utf-8") as f:
 
-    split_text = splitter.split_text(doc["text"])
+        for line in f:
 
-    for chunk in split_text:
+            message = json.loads(line)
 
-        chunks.append(
-            {
-                "source": doc["source"],
-                "text": chunk
-            }
-        )
+            text = build_text(message)
 
-print(f"\nCreated {len(chunks)} chunks.")
+            if text is None:
+                continue
 
-# ==========================
-# CREATE EMBEDDINGS
-# ==========================
+            embedding = generate_embedding(text, model)
 
-texts = [c["text"] for c in chunks]
+            embeddings.append(embedding)
 
-print("Generating embeddings...")
+            metadata.append({
+                "id": message["id"],
+                "channel": jsonl_path,
+                "content": message["content"],
+                "author": message["author"]["display_name"],
+                "created_at": message["created_at"]
+            })
 
-response = ollama.embed(
-    model=EMBED_MODEL,
-    input=texts
-)
+    return embeddings, metadata
 
-embeddings = response["embeddings"]
 
-print(f"Generated {len(embeddings)} embeddings.")
+def embed_jsonl_batch(jsonl_path, batch_size=128, model="nomic-embed-text"):
+    """
+    Reads a JSONL file and yields batches of embeddings and metadata.
 
-# ==========================
-# BUILD FAISS INDEX
-# ==========================
+    Returns:
+        embeddings : list[list[float]]
+        metadata   : list[dict]
+    """
 
-dimension = len(embeddings[0])
+    batch_text = []
+    batch_metadata = []
 
-index = faiss.IndexFlatL2(dimension)
+    with open(jsonl_path, "r", encoding="utf-8") as f:
 
-embedding_array = np.array(
-    embeddings,
-    dtype=np.float32
-)
+        for line in f:
 
-index.add(embedding_array)
+            message = json.loads(line)
 
-# ==========================
-# SAVE EVERYTHING
-# ==========================
+            text = build_text(message)
 
-faiss.write_index(index, FAISS_INDEX)
+            if text is None:
+                continue
 
-with open(CHUNKS_FILE, "wb") as f:
-    pickle.dump(chunks, f)
+            batch_text.append(text)
 
-print("\nFinished!")
-print(f"FAISS index saved to: {FAISS_INDEX}")
-print(f"Chunks saved to: {CHUNKS_FILE}")
-print(f"Total chunks: {len(chunks)}")
+            batch_metadata.append({
+                "id": message["id"],
+                "content": message["content"],
+                "author": message["author"]["display_name"],
+                "created_at": message["created_at"]
+            })
+
+            if len(batch_text) == batch_size:
+
+                response = ollama.embed(
+                    model=model,
+                    input=batch_text
+                )
+
+                yield response["embeddings"], batch_metadata
+
+                batch_text = []
+                batch_metadata = []
+
+        # Embed any remaining messages
+        if batch_text:
+
+            response = ollama.embed(
+                model=model,
+                input=batch_text
+            )
+
+            yield response["embeddings"], batch_metadata
+
+
+if __name__ == "__main__":
+    paths = [
+        "E:/discord_server_txt/",  # Desktop
+        "/media/pi/Transcend/discord_server_txt/",  # Raspberry Pi
+    ]
+    embeddings, metadata = embed_jsonl()
