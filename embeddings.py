@@ -123,4 +123,5 @@ if __name__ == "__main__":
         "E:/discord_server_txt/",  # Desktop
         "/media/pi/Transcend/discord_server_txt/",  # Raspberry Pi
     ]
-    embeddings, metadata = embed_jsonl()
+    jsonl_test = "./intros.jsonl"
+    embeddings, metadata = embed_jsonl(jsonl_test)
