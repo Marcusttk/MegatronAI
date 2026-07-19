@@ -1,270 +1,332 @@
+from __future__ import annotations
+
 import sqlite3
-import json
 from pathlib import Path
-from datetime import datetime
+from typing import Any, Iterable, Sequence
+
+
+DEFAULT_DATABASE_PATH = Path("data/discord.db")
 
 
 class Database:
+    def __init__(
+        self,
+        database_path: str | Path = DEFAULT_DATABASE_PATH,
+    ) -> None:
+        self.database_path = Path(database_path)
+        self.database_path.parent.mkdir(parents=True, exist_ok=True)
 
-    def __init__(self, db_path="data/discord.db"):
-
-        db_path = Path(db_path)
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-
-        self.conn = sqlite3.connect(db_path)
-        self.conn.row_factory = sqlite3.Row
-
-        self.conn.execute("PRAGMA journal_mode=WAL;")
-        self.conn.execute("PRAGMA foreign_keys = ON;")
-
-        self.create_tables()
-
-    ######################################################################
-
-    def create_tables(self):
-
-        self.conn.executescript("""
-
-        CREATE TABLE IF NOT EXISTS messages(
-
-            message_id          INTEGER PRIMARY KEY,
-
-            channel_id          INTEGER,
-
-            author_id           INTEGER,
-            author_name         TEXT,
-            display_name        TEXT,
-
-            content             TEXT,
-
-            created_at          TEXT,
-            edited_at           TEXT,
-
-            reply_to            INTEGER,
-
-            jump_url            TEXT,
-
-            has_attachment      INTEGER DEFAULT 0,
-
-            json_blob           TEXT
-        );
-
-        CREATE TABLE IF NOT EXISTS attachments(
-
-            id                  INTEGER PRIMARY KEY AUTOINCREMENT,
-
-            message_id          INTEGER,
-
-            filename            TEXT,
-            url                 TEXT,
-
-            FOREIGN KEY(message_id)
-                REFERENCES messages(message_id)
-                ON DELETE CASCADE
-        );
-
-        CREATE TABLE IF NOT EXISTS embeddings(
-
-            message_id          INTEGER PRIMARY KEY,
-
-            faiss_id            INTEGER UNIQUE,
-
-            embedding_model     TEXT,
-
-            embedded_at         TEXT,
-
-            FOREIGN KEY(message_id)
-                REFERENCES messages(message_id)
-                ON DELETE CASCADE
-        );
-
-        CREATE INDEX IF NOT EXISTS idx_channel
-        ON messages(channel_id);
-
-        CREATE INDEX IF NOT EXISTS idx_author
-        ON messages(author_id);
-
-        CREATE INDEX IF NOT EXISTS idx_created
-        ON messages(created_at);
-
-        """)
-
-        self.conn.commit()
-
-    ######################################################################
-
-    def import_jsonl(self, filename, channel_id):
-
-        imported = 0
-
-        with open(filename, "r", encoding="utf8") as f:
-
-            for line in f:
-
-                line = line.strip()
-
-                if not line:
-                    continue
-
-                msg = json.loads(line)
-
-                author = msg["author"]
-
-                self.conn.execute("""
-                INSERT OR REPLACE INTO messages
-                (
-                    message_id,
-                    channel_id,
-                    author_id,
-                    author_name,
-                    display_name,
-                    content,
-                    created_at,
-                    edited_at,
-                    reply_to,
-                    jump_url,
-                    has_attachment,
-                    json_blob
-                )
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
-                """,
-                (
-                    msg["id"],
-                    channel_id,
-                    author["id"],
-                    author["name"],
-                    author["display_name"],
-                    msg.get("content", ""),
-                    msg.get("created_at"),
-                    msg.get("edited_at"),
-                    msg.get("reply_to"),
-                    msg.get("jump_url"),
-                    int(len(msg.get("attachments", [])) > 0),
-                    json.dumps(msg)
-                ))
-
-                for attachment in msg.get("attachments", []):
-
-                    self.conn.execute("""
-                    INSERT INTO attachments
-                    (
-                        message_id,
-                        filename,
-                        url
-                    )
-                    VALUES (?,?,?)
-                    """,
-                    (
-                        msg["id"],
-                        attachment.get("filename"),
-                        attachment.get("url")
-                    ))
-
-                imported += 1
-
-        self.conn.commit()
-
-        print(f"Imported {imported:,} messages.")
-
-    ######################################################################
-
-    def get_message(self, message_id):
-
-        cur = self.conn.execute("""
-        SELECT *
-        FROM messages
-        WHERE message_id = ?
-        """, (message_id,))
-
-        return cur.fetchone()
-
-    ######################################################################
-
-    def get_unembedded_messages(self, limit=None):
-
-        sql = """
-        SELECT
-            message_id,
-            channel_id,
-            author_id,
-            author_name,
-            display_name,
-            content,
-            created_at
-        FROM messages
-        WHERE message_id NOT IN
-        (
-            SELECT message_id
-            FROM embeddings
+        self.connection = sqlite3.connect(
+            self.database_path,
+            timeout=60,
         )
-        AND TRIM(content) != ''
-        ORDER BY created_at
-        """
 
-        if limit is not None:
-            sql += " LIMIT ?"
-            cur = self.conn.execute(sql, (limit,))
-        else:
-            cur = self.conn.execute(sql)
+        self.connection.row_factory = sqlite3.Row
 
-        return cur.fetchall()
+        self._configure()
+        self._create_tables()
 
-    ######################################################################
+    def _configure(self) -> None:
+        self.connection.execute("PRAGMA journal_mode = WAL")
+        self.connection.execute("PRAGMA synchronous = NORMAL")
+        self.connection.execute("PRAGMA temp_store = MEMORY")
+        self.connection.execute("PRAGMA foreign_keys = ON")
+        self.connection.execute("PRAGMA busy_timeout = 60000")
 
-    def add_embedding(self, message_id, faiss_id, model):
+    def _create_tables(self) -> None:
+        self.connection.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS messages (
+                id                  INTEGER PRIMARY KEY,
+                guild_id            INTEGER,
+                channel_id          INTEGER,
+                channel_name        TEXT NOT NULL,
+                source_file         TEXT NOT NULL,
 
-        self.conn.execute("""
-        INSERT OR REPLACE INTO embeddings
-        (
-            message_id,
-            faiss_id,
-            embedding_model,
-            embedded_at
+                author_id           INTEGER,
+                author_name         TEXT,
+                author_display_name TEXT,
+                author_bot          INTEGER NOT NULL DEFAULT 0,
+
+                content             TEXT NOT NULL,
+                created_at          TEXT,
+                edited_at           TEXT,
+                reply_to            INTEGER,
+                jump_url            TEXT,
+
+                embedded            INTEGER NOT NULL DEFAULT 0,
+                imported_at         TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_messages_channel
+                ON messages(channel_id);
+
+            CREATE INDEX IF NOT EXISTS idx_messages_author
+                ON messages(author_id);
+
+            CREATE INDEX IF NOT EXISTS idx_messages_created
+                ON messages(created_at);
+
+            CREATE INDEX IF NOT EXISTS idx_messages_embedded
+                ON messages(embedded);
+
+            CREATE INDEX IF NOT EXISTS idx_messages_channel_name
+                ON messages(channel_name);
+
+
+            CREATE TABLE IF NOT EXISTS build_metadata (
+                key   TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
+            """
         )
-        VALUES (?,?,?,?)
-        """,
-        (
-            message_id,
-            faiss_id,
-            model,
-            datetime.utcnow().isoformat()
-        ))
 
-        self.conn.commit()
+        self.connection.commit()
 
-    ######################################################################
+    def insert_messages(
+        self,
+        messages: Sequence[dict[str, Any]],
+    ) -> int:
+        if not messages:
+            return 0
 
-    def close(self):
+        rows = [
+            (
+                message["id"],
+                message.get("guild_id"),
+                message.get("channel_id"),
+                message["channel_name"],
+                message["source_file"],
+                message.get("author_id"),
+                message.get("author_name"),
+                message.get("author_display_name"),
+                int(bool(message.get("author_bot", False))),
+                message.get("content", ""),
+                message.get("created_at"),
+                message.get("edited_at"),
+                message.get("reply_to"),
+                message.get("jump_url"),
+            )
+            for message in messages
+        ]
 
-        self.conn.close()
+        before = self.connection.total_changes
 
-    ######################################################################
+        self.connection.executemany(
+            """
+            INSERT OR IGNORE INTO messages (
+                id,
+                guild_id,
+                channel_id,
+                channel_name,
+                source_file,
 
-    def get_messages_by_faiss_ids(self, faiss_ids):
+                author_id,
+                author_name,
+                author_display_name,
+                author_bot,
 
-        # Convert NumPy array to a normal Python list and remove invalid IDs
-        faiss_ids = [int(i) for i in faiss_ids if i >= 0]
+                content,
+                created_at,
+                edited_at,
+                reply_to,
+                jump_url
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            rows,
+        )
 
-        if len(faiss_ids) == 0:
+        self.connection.commit()
+
+        return self.connection.total_changes - before
+
+    def insert_live_message(
+        self,
+        message: dict[str, Any],
+    ) -> bool:
+        inserted = self.insert_messages([message])
+        return inserted == 1
+
+    def get_unembedded_messages(
+        self,
+        limit: int,
+    ) -> list[dict[str, Any]]:
+        rows = self.connection.execute(
+            """
+            SELECT
+                id,
+                guild_id,
+                channel_id,
+                channel_name,
+                author_id,
+                author_name,
+                author_display_name,
+                content,
+                created_at,
+                edited_at,
+                reply_to,
+                jump_url
+            FROM messages
+            WHERE embedded = 0
+              AND TRIM(content) != ''
+              AND author_bot = 0
+            ORDER BY id
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+
+        return [dict(row) for row in rows]
+
+    def mark_embedded(
+        self,
+        message_ids: Iterable[int],
+    ) -> None:
+        ids = [(int(message_id),) for message_id in message_ids]
+
+        if not ids:
+            return
+
+        self.connection.executemany(
+            """
+            UPDATE messages
+            SET embedded = 1
+            WHERE id = ?
+            """,
+            ids,
+        )
+
+        self.connection.commit()
+
+    def reset_embedding_state(self) -> None:
+        self.connection.execute(
+            """
+            UPDATE messages
+            SET embedded = 0
+            """
+        )
+
+        self.connection.commit()
+
+    def count_messages(self) -> int:
+        row = self.connection.execute(
+            "SELECT COUNT(*) AS count FROM messages"
+        ).fetchone()
+
+        return int(row["count"])
+
+    def count_embeddable_messages(self) -> int:
+        row = self.connection.execute(
+            """
+            SELECT COUNT(*) AS count
+            FROM messages
+            WHERE TRIM(content) != ''
+              AND author_bot = 0
+            """
+        ).fetchone()
+
+        return int(row["count"])
+
+    def count_embedded_messages(self) -> int:
+        row = self.connection.execute(
+            """
+            SELECT COUNT(*) AS count
+            FROM messages
+            WHERE embedded = 1
+            """
+        ).fetchone()
+
+        return int(row["count"])
+
+    def get_messages_by_ids(
+        self,
+        message_ids: Sequence[int],
+    ) -> list[dict[str, Any]]:
+        if not message_ids:
             return []
 
-        placeholders = ",".join(["?"] * len(faiss_ids))
+        placeholders = ",".join("?" for _ in message_ids)
 
-        sql = f"""
-        SELECT
-            m.*,
-            e.faiss_id
-        FROM messages m
-        JOIN embeddings e
-            ON m.message_id = e.message_id
-        WHERE e.faiss_id IN ({placeholders})
-        """
+        rows = self.connection.execute(
+            f"""
+            SELECT
+                id,
+                guild_id,
+                channel_id,
+                channel_name,
 
-        cur = self.conn.execute(sql, faiss_ids)
+                author_id,
+                author_name,
+                author_display_name,
 
-        rows = cur.fetchall()
+                content,
+                created_at,
+                edited_at,
+                reply_to,
+                jump_url
+            FROM messages
+            WHERE id IN ({placeholders})
+            """,
+            tuple(int(message_id) for message_id in message_ids),
+        ).fetchall()
 
-        lookup = {row["faiss_id"]: row for row in rows}
+        messages_by_id = {
+            int(row["id"]): dict(row)
+            for row in rows
+        }
 
-        # Return rows in the same order as FAISS returned them
-        return [lookup[i] for i in faiss_ids if i in lookup]
+        return [
+            messages_by_id[message_id]
+            for message_id in message_ids
+            if message_id in messages_by_id
+        ]
+
+    def set_metadata(
+        self,
+        key: str,
+        value: str,
+    ) -> None:
+        self.connection.execute(
+            """
+            INSERT INTO build_metadata(key, value)
+            VALUES (?, ?)
+            ON CONFLICT(key) DO UPDATE SET
+                value = excluded.value
+            """,
+            (key, value),
+        )
+
+        self.connection.commit()
+
+    def get_metadata(
+        self,
+        key: str,
+    ) -> str | None:
+        row = self.connection.execute(
+            """
+            SELECT value
+            FROM build_metadata
+            WHERE key = ?
+            """,
+            (key,),
+        ).fetchone()
+
+        if row is None:
+            return None
+
+        return str(row["value"])
+
+    def close(self) -> None:
+        self.connection.close()
+
+    def __enter__(self) -> "Database":
+        return self
+
+    def __exit__(
+        self,
+        exc_type: object,
+        exc_value: object,
+        traceback: object,
+    ) -> None:
+        self.close()
